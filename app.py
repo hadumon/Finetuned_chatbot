@@ -1,7 +1,7 @@
-import torch
 import streamlit as st
 import warnings
-from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
+import google.generativeai as genai
+import os
 import speech_recognition as sr
 import pyttsx3
 from sklearn.feature_extraction.text import TfidfVectorizer
@@ -13,6 +13,9 @@ import sqlite3
 import bcrypt
 import random
 import string
+from dotenv import load_dotenv
+
+load_dotenv()
 
 # Suppress unnecessary warnings
 warnings.filterwarnings("ignore")
@@ -140,23 +143,30 @@ def reset_password(user_id, new_password):
     conn.close()
 
 # --- Chatbot Setup ---
-device = 'cuda' if torch.cuda.is_available() else 'cpu'
-st.write(f"Running on: {device}")
-
-model_path = "chatbot_finetuned"  # Adjust to your model path
-tokenizer = AutoTokenizer.from_pretrained(model_path)
-model = AutoModelForSeq2SeqLM.from_pretrained(model_path, use_safetensors=True, torch_dtype=torch.float16)
-model = model.to(device)
-model.eval()
+# Configure Gemini API
+genai.configure(api_key=os.environ.get('GEMINI_API_KEY'))
 
 tts_engine = pyttsx3.init()
+
+# Default response length for search results
+default_max_length = 150
 
 generic_responses = ["please provide more details", "could you please provide", "i need more information"]
 require_details_intents = ["track_order", "cancel_order", "change_order"]
 
 # --- Wikipedia Search ---
 def search_wikipedia(query, num_results=3):
-    clean_query = re.sub(r'could you search (?:about|for)?|on wikipedia\??', '', query, flags=re.IGNORECASE).strip()
+    # Extract clear topic words only - be more careful with cleaning
+    clean_query = re.sub(
+        r'(?:could you|please|can you|i want to|tell me|find|look up|search for|about|on wikipedia|\?|wikipedia)',
+        '',
+        query, flags=re.IGNORECASE
+    ).strip()
+
+    # Prevent too-short queries that would match random things
+    if len(clean_query) < 3 or not clean_query.replace(' ', '').isalnum():
+        return [], clean_query
+
     try:
         search_results = wikipedia.search(clean_query, results=num_results)
         snippets = []
@@ -166,34 +176,25 @@ def search_wikipedia(query, num_results=3):
                 snippets.append(page.summary[:2000])
             except wikipedia.exceptions.DisambiguationError:
                 pass
-        return snippets
-    except Exception as e:
-        return []
+        return snippets, clean_query
+    except Exception:
+        return [], clean_query
+
 
 # --- Response Generation ---
-def generate_contextual_response(prompt, model, tokenizer, max_length=80, num_beams=5):
-    inputs = tokenizer(prompt, return_tensors="pt", truncation=True, padding=True, max_length=512)
-    input_ids = inputs['input_ids'].to(device)
-    attention_mask = inputs['attention_mask'].to(device)
-    
-    with torch.no_grad():
-        outputs = model.generate(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            max_length=max_length,
-            num_beams=num_beams,
-            early_stopping=True
-        )
-    response = tokenizer.decode(outputs[0], skip_special_tokens=True)
-    
-    if "what is your name" in response.lower() and st.session_state['user_profile'].get('name'):
-        response = response.replace("What is your name?", f"Thanks for letting me know your name is {st.session_state['user_profile']['name']}.")
-    if "what is your email" in response.lower() and st.session_state['user_profile'].get('email'):
-        response = response.replace("What is your email?", f"I already have your email as {st.session_state['user_profile']['email']}.")
-    if "what is your phone" in response.lower() and st.session_state['user_profile'].get('phone'):
-        response = response.replace("What is your phone number?", f"I have your phone number as {st.session_state['user_profile']['phone']}.")
-    
-    return response
+def generate_contextual_response(prompt):
+    model = genai.GenerativeModel('models/gemini-pro')
+    response = model.generate_content(prompt)
+    text = response.text
+
+    if "what is your name" in text.lower() and st.session_state['user_profile'].get('name'):
+        text = text.replace("What is your name?", f"Thanks for letting me know your name is {st.session_state['user_profile']['name']}.")
+    if "what is your email" in text.lower() and st.session_state['user_profile'].get('email'):
+        text = text.replace("What is your email?", f"I already have your email as {st.session_state['user_profile']['email']}.")
+    if "what is your phone" in text.lower() and st.session_state['user_profile'].get('phone'):
+        text = text.replace("What is your phone number?", f"I have your phone number as {st.session_state['user_profile']['phone']}.")
+
+    return text
 
 # --- Voice Input ---
 def transcribe_voice():
@@ -223,7 +224,7 @@ def parse_instruction(intent, instruction):
         "cancel_order": r'(?:cancel order|order number|my order number is)[\s:]*([\w!@]+)',
         "change_order": r'(?:change order|order number|my order number is)[\s:]*([\w!@]+)',
         "create_account": r'full name:\s*([\w\s]+)|email:\s*([\w\.\@]+)|username:\s*(\w+)',
-        "search": r'search (?:about|for)?\s*(.+?)(?:\s*on\s*wikipedia)?'
+        "search": r'(?:search|look up|find|tell me about)\s+(?:about|for)?\s*([A-Za-z0-9\-\_\(\) ]+?)(?:\s*on\s*wikipedia)?$'
     }
     
     user_info_patterns = {
@@ -268,29 +269,34 @@ def parse_instruction(intent, instruction):
 
 # --- Prompt Building ---
 def build_prompt(intent, instruction, parsed_detail, history):
-    system_message = "You are a helpful assistant. Use details to respond specifically, asking for more only if needed."
+    system_message = "You are a helpful assistant."
     user_context = ""
     if st.session_state['user_profile'].get('name'):
         user_context += f" The user's name is {st.session_state['user_profile']['name']}."
     
-    if history:
-        past_texts = [f"Intent: {item['intent']} Instruction: {item['instruction']} Response: {item['response']}" 
-                      for item in history if item['instruction']]  # Exclude placeholder entries
-        current_text = f"Intent: {intent} Instruction: {instruction}"
-        vectorizer = TfidfVectorizer()
-        past_vectors = vectorizer.fit_transform(past_texts)
-        current_vector = vectorizer.transform([current_text])
-        similarities = cosine_similarity(current_vector, past_vectors)
-        top_indices = similarities.argsort()[0][-3:][::-1]
-        relevant_history = " | ".join([past_texts[i] for i in top_indices])
+    # Filter history to only include real user messages
+    past_texts = [f"Intent: {item['intent']} Instruction: {item['instruction']} Response: {item['response']}" 
+                  for item in history if item['instruction'] and len(item['instruction']) > 5]
+
+    relevant_history = ""
+    if past_texts:
+        try:
+            vectorizer = TfidfVectorizer()
+            past_vectors = vectorizer.fit_transform(past_texts)
+            current_text = f"Intent: {intent} Instruction: {instruction}"
+            current_vector = vectorizer.transform([current_text])
+            
+            similarities = cosine_similarity(current_vector, past_vectors)
+            top_indices = similarities.argsort()[0][-3:][::-1]
+            relevant_history = " | ".join([past_texts[i] for i in top_indices])
+        except ValueError:
+            # Fallback if text is too short or contains only stop words
+            relevant_history = " | ".join(past_texts[-2:]) 
+
+    if relevant_history:
         prompt = f"{system_message} | User context: {user_context} | Relevant history: {relevant_history} | Current: Intent: {intent} Instruction: {instruction}"
     else:
         prompt = f"{system_message} | User context: {user_context} | Intent: {intent} Instruction: {instruction}"
-    
-    if parsed_detail:
-        prompt += f" | User provided detail: {parsed_detail}"
-    elif intent != "search":
-        prompt += " | If details are missing, ask for more only if not in user context."
     
     return prompt
 
@@ -354,8 +360,7 @@ if st.session_state.get('logged_in', False):
     st.title("Dynamic Intent Chatbot with RAG")
     st.markdown("Chat with a finetuned-bot that adapts to any intent using conversation memory and external knowledge!")
     st.markdown("---")
-    st.markdown("Finetuned model: `facebook/bart-base`")
-    st.markdown("Finetuned on: `Bitext-customer-support-llm-chatbot-training-dataset`")
+    st.markdown("Using: `Google Gemini API (models/gemini-pro)`")
 
     # Initialize thread if none exists
     if 'user_id' in st.session_state and st.session_state['current_thread_id'] is None:
@@ -405,9 +410,6 @@ if st.session_state.get('logged_in', False):
     else:
         st.write("No user profile information available yet.")
 
-    max_length = st.slider("Response Max Length", min_value=50, max_value=500, value=150, step=10)
-    num_beams = st.slider("Number of Beams", min_value=1, max_value=20, value=5)
-
     st.subheader(f"Conversation History - Thread {st.session_state['current_thread_id']}")
     history = load_conversation_history(st.session_state['user_id'], st.session_state['current_thread_id'])
     if history:
@@ -424,44 +426,66 @@ if st.session_state.get('logged_in', False):
                 st.warning("Please provide an instruction.")
             else:
                 st.session_state['instruction'] = instruction.strip()
+
+                # --- AUTO-DETECT SEARCH INTENT ---
+                if intent is None and re.search(r'search|wikipedia', instruction, re.IGNORECASE):
+                    intent = "search"
+
+                # Parse instruction details (e.g., order number, user info)
                 parsed_detail = parse_instruction(intent, instruction) if intent else None
+
                 with st.spinner("Generating response..."):
+
+                    # --- SEARCH INTENT HANDLING ---
                     if intent == "search":
-                        snippets = search_wikipedia(instruction)
+                        snippets, search_topic = search_wikipedia(instruction)
                         if snippets:
-                            search_topic = parsed_detail if parsed_detail else instruction.strip()
-                            full_text = f"Here’s what I found about {search_topic}: " + " ".join(snippets)
-                            char_limit = max_length * 4
+                            full_text = f"Here’s what I found about {search_topic}:\n\n" + "\n\n".join(snippets)
+                            char_limit = default_max_length * 4
                             if len(full_text) > char_limit:
                                 trimmed_text = full_text[:char_limit].rsplit('.', 1)[0] + '.'
                                 if len(trimmed_text) > char_limit or trimmed_text == full_text[:char_limit] + '.':
                                     trimmed_text = full_text[:char_limit].rsplit(' ', 1)[0] + '...'
-                                response = trimmed_text
+                                    response = trimmed_text
+                                else:
+                                    response = full_text
                             else:
                                 response = full_text
                         else:
-                            suggestions = wikipedia.search(instruction, results=3)
-                            response = f"No exact match found. Suggestions: {', '.join(suggestions)}." if suggestions else "Sorry, I couldn’t find anything on Wikipedia about that."
+                            response = f"Sorry, I couldn't find anything on Wikipedia about \"{search_topic}\"."
+
+                    elif intent in require_details_intents and parsed_detail is None:
+                        if intent == "track_order":
+                            response = "Please provide your order number to track."
+                        elif intent == "cancel_order":
+                            response = "Please provide your order number to cancel."
+                        elif intent == "change_order":
+                            response = "Please provide your order number to change."
+                        set_state(intent, "awaiting_details")
                     else:
-                        if intent in require_details_intents and parsed_detail is None:
-                            if intent == "track_order":
-                                response = "Please provide your order number to track."
-                            elif intent == "cancel_order":
-                                response = "Please provide your order number to cancel."
-                            elif intent == "change_order":
-                                response = "Please provide your order number to change."
-                            set_state(intent, "awaiting_details")
-                        else:
-                            prompt = build_prompt(intent or "None", instruction, parsed_detail, history)
-                            response = generate_contextual_response(prompt, model, tokenizer, max_length, num_beams)
-                            set_state(intent or "None", "initial")
-                    st.subheader("Chatbot Response")
-                    st.success(response)
-                    insert_conversation_history(st.session_state['user_id'], st.session_state['current_thread_id'], intent or "None", instruction, response)
-                    if not tts_engine.isBusy():
-                        tts_engine.say(response)
-                        tts_engine.runAndWait()
-                        tts_engine.stop()
+                    # OTHER INTENTS: USE LLM
+                        prompt = build_prompt(intent or "None", instruction, parsed_detail, history)
+                        response = generate_contextual_response(prompt)
+                        set_state(intent or "None", "initial")
+
+
+                # --- DISPLAY AND SAVE RESPONSE ---
+                st.subheader("Chatbot Response")
+                st.success(response)
+                insert_conversation_history(
+                    st.session_state['user_id'],
+                    st.session_state['current_thread_id'],
+                    intent or "None",
+                    instruction,
+                    response
+                )
+
+                # --- TTS ---
+                if not tts_engine.isBusy():
+                    tts_engine.say(response)
+                    tts_engine.runAndWait()
+                    tts_engine.stop()
+
 
     with col6:
         if st.button("Reset Instruction"):
@@ -568,4 +592,4 @@ else:
                 conn.close()
 
     st.write("Please log in, create an account, or reset your password to use the chatbot.")
-    
+
